@@ -3,12 +3,14 @@ from collections import namedtuple
 
 from opendbc.can import CANPacker
 from opendbc.car import Bus, DT_CTRL, rate_limit, make_tester_present_msg, structs
+from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.honda import hondacan
 from opendbc.car.honda.values import CruiseButtons, VISUAL_HUD, HONDA_BOSCH, HONDA_BOSCH_CANFD, HONDA_BOSCH_RADARLESS, \
-                                     HONDA_NIDEC_ALT_PCM_ACCEL, CarControllerParams
+                                     HONDA_NIDEC_ALT_PCM_ACCEL, CarControllerParams, CAR
 from opendbc.car.interfaces import CarControllerBase
 
 from opendbc.sunnypilot.car.honda.mads import MadsCarController
+from opendbc.sunnypilot.car.honda.values_ext import HondaFlagsSP
 
 VisualAlert = structs.CarControl.HUDControl.VisualAlert
 LongCtrlState = structs.CarControl.Actuators.LongControlState
@@ -94,6 +96,25 @@ def process_hud_alert(hud_alert):
   return fcw_display, steer_required, acc_alert
 
 
+# NRDR modified-EPS steering command shaping (Civic Bosch on the TGG-A120 4250 / C020 / C120 images).
+# Values are the ones Peter runs on night-star (2026-08-27 toggle backup), hard-coded here on purpose:
+#   HondaOverrideFadeDownSecs 0.0, HondaOverrideFadeUpSecs 1.0, HondaOverrideTorqueScale 0,
+#   HondaDriverAssistDuringOverride on, HondaTorqueLowPassFilter on,
+#   HondaLpfTauLowSpeed 0.08, HondaLpfTauStandard 0.1, HondaLpfTauHighway 0.1, NrdrMinSteerSpeed 2 mph.
+EPS_MOD_OVERRIDE_FADE_DOWN_S = 0.0   # driver override: drop the command immediately (James: fade down = 0)
+EPS_MOD_OVERRIDE_FADE_UP_S = 1.0     # after release / on engage: ramp back to full authority over 1.0 s
+EPS_MOD_LPF_TAU_S = (0.08, 0.10, 0.10)  # torque low-pass time constant below 25 mph / to 50 mph / above
+EPS_MOD_MIN_STEER_SPEED = 2. * CV.MPH_TO_MS  # no torque and no LKAS request below this
+
+
+def torque_lpf_tau(v_ego, low_tau, standard_tau, highway_tau):
+  if v_ego < 25. * CV.MPH_TO_MS:
+    return low_tau
+  if v_ego < 50. * CV.MPH_TO_MS:
+    return standard_tau
+  return highway_tau
+
+
 HUDData = namedtuple("HUDData",
                      ["pcm_accel", "v_cruise", "lead_visible",
                       "lanes_visible", "fcw", "acc_alert", "steer_required", "lead_distance_bars", "dashed_lanes"])
@@ -120,6 +141,59 @@ class CarController(CarControllerBase, MadsCarController):
     self.brake = 0.0
     self.last_torque = 0.0
 
+    self.eps_mod_lateral = CP.carFingerprint == CAR.HONDA_CIVIC_BOSCH and bool(CP_SP.flags & HondaFlagsSP.EPS_MODIFIED)
+    self.torque_lpf = 0.0
+    self.override_ramp = 1.0
+    self.lat_active_prev = False
+
+  def _eps_mod_steering_torque(self, CC, CS):
+    """Steering command shaping for the NRDR modified-EPS Civic Bosch.
+
+    Port of night-star's CarController._update_steering_torque (JamesL787/openpilot 491fccb4, 29a31500,
+    cbf4a21a) and nrdr-nightly's HondaControllerFeatures.update_steering_torque, with the live
+    toggles replaced by the constants above. Returns (torque, lkas_active).
+    """
+    torque_cmd = float(CC.actuators.torque) if CC.latActive else 0.0
+    below_min_steer_speed = CS.out.vEgo < EPS_MOD_MIN_STEER_SPEED
+    if below_min_steer_speed:
+      torque_cmd = 0.0
+
+    if CC.latActive:
+      if not self.lat_active_prev:
+        self.override_ramp = 0.0
+
+      # Override fade: on a strong rack, torque fighting the driver is what grinds and pins the wheel
+      # after a turn, so the command is cut immediately on override and eased back in on release.
+      if CS.out.steeringPressed:
+        if EPS_MOD_OVERRIDE_FADE_DOWN_S <= 0.0:
+          self.override_ramp = 0.0
+        else:
+          self.override_ramp = max(0.0, self.override_ramp - DT_CTRL / EPS_MOD_OVERRIDE_FADE_DOWN_S)
+      else:
+        self.override_ramp = min(1.0, self.override_ramp + DT_CTRL / EPS_MOD_OVERRIDE_FADE_UP_S)
+      torque_cmd *= self.override_ramp
+
+      # Speed-banded first-order low-pass on the torque command (EPS stutter / resonance damping).
+      tau = torque_lpf_tau(CS.out.vEgo, *EPS_MOD_LPF_TAU_S)
+      alpha = DT_CTRL / (tau + DT_CTRL)
+      self.torque_lpf = alpha * torque_cmd + (1.0 - alpha) * self.torque_lpf
+      torque_cmd = self.torque_lpf
+    else:
+      self.override_ramp = 0.0
+      self.torque_lpf = 0.0
+
+    # Keep the upstream STEER_DELTA rate limiter as the last stage. Deliberate deviation: night-star
+    # only applies it when HondaSteerDeltaLimiter is on (off by default). It bounds the override cut
+    # to ~0.17 s from full torque, comparable to the LPF tail, and keeps upstream's request shaping.
+    limited_torque = rate_limit(torque_cmd, self.last_torque, -self.params.STEER_DELTA_DOWN * DT_CTRL,
+                                self.params.STEER_DELTA_UP * DT_CTRL)
+    self.lat_active_prev = CC.latActive
+
+    # Driver assist during override: keep STEER_TORQUE_REQUEST asserted while the driver overrides
+    # (the command itself is already faded to zero), so the EPS does not drop out and re-engage.
+    lkas_active = CC.latActive and not below_min_steer_speed
+    return limited_torque, lkas_active
+
   def update(self, CC, CC_SP, CS, now_nanos):
     MadsCarController.update(self, self.CP, CC, CC_SP)
     actuators = CC.actuators
@@ -135,8 +209,12 @@ class CarController(CarControllerBase, MadsCarController):
       gas, brake = 0.0, 0.0
 
     # *** rate limit steer ***
-    limited_torque = rate_limit(actuators.torque, self.last_torque, -self.params.STEER_DELTA_DOWN * DT_CTRL,
-                                self.params.STEER_DELTA_UP * DT_CTRL)
+    if self.eps_mod_lateral:
+      limited_torque, lkas_active = self._eps_mod_steering_torque(CC, CS)
+    else:
+      limited_torque = rate_limit(actuators.torque, self.last_torque, -self.params.STEER_DELTA_DOWN * DT_CTRL,
+                                  self.params.STEER_DELTA_UP * DT_CTRL)
+      lkas_active = CC.latActive
     self.last_torque = limited_torque
 
     # *** apply brake hysteresis ***
@@ -164,7 +242,7 @@ class CarController(CarControllerBase, MadsCarController):
         can_sends.append(make_tester_present_msg(0x18DAB0F1, 1, suppress_response=True))
 
     # Send steering command.
-    can_sends.append(hondacan.create_steering_control(self.packer, self.CAN, apply_torque, CC.latActive))
+    can_sends.append(hondacan.create_steering_control(self.packer, self.CAN, apply_torque, lkas_active))
 
     # wind brake from air resistance decel at high speed
     wind_brake = np.interp(CS.out.vEgo, [0.0, 2.3, 35.0], [0.001, 0.002, 0.15])
