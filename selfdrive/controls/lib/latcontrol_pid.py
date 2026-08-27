@@ -1,8 +1,19 @@
 import math
+import numpy as np
 
 from cereal import log
+from opendbc.car.honda.values import CAR as HONDA
+from opendbc.sunnypilot.car.honda.values_ext import HondaFlagsSP
 from openpilot.selfdrive.controls.lib.latcontrol import LatControl
 from openpilot.common.pid import PIDController
+
+# NRDR modified-EPS speed-banded feedforward for the Civic Bosch on the TGG-A120 4250 image. night-star
+# applies this at runtime (selfdrive/controls/lib/latcontrol_pid.py NRDR_MODIFIED_EPS_KF_*, 84f1b7ec) on
+# top of the scalar kf 3.6e-6 that CarParams carries; this schema has no kfBP/kfV, so it lives here.
+# Duplicate-near-25 mph breakpoint preserves the hard hand-off of the kp/ki schedule.
+_MPH = 0.44704
+EPS_MOD_KF_BP = [0.0, 25.0 * _MPH - 1e-3, 25.0 * _MPH, 50.0 * _MPH]
+EPS_MOD_KF_V = [2.4e-6, 1.8e-6, 3.6e-6, 6.0e-6]
 
 
 class LatControlPID(LatControl):
@@ -12,6 +23,7 @@ class LatControlPID(LatControl):
                              (CP.lateralTuning.pid.kiBP, CP.lateralTuning.pid.kiV),
                              k_f=CP.lateralTuning.pid.kf, pos_limit=self.steer_max, neg_limit=-self.steer_max)
     self.get_steer_feedforward = CI.get_steer_feedforward_function()
+    self.eps_mod_banded_kf = CP.carFingerprint == HONDA.HONDA_CIVIC_BOSCH and bool(CP_SP.flags & HondaFlagsSP.EPS_MODIFIED)
 
   def update(self, active, CS, VM, params, steer_limited_by_safety, desired_curvature, calibrated_pose, curvature_limited):
     pid_log = log.ControlsState.LateralPIDState.new_message()
@@ -30,6 +42,8 @@ class LatControlPID(LatControl):
 
     else:
       # offset does not contribute to resistive torque
+      if self.eps_mod_banded_kf:
+        self.pid.k_f = float(np.interp(CS.vEgo, EPS_MOD_KF_BP, EPS_MOD_KF_V))
       ff = self.get_steer_feedforward(angle_steers_des_no_offset, CS.vEgo)
       freeze_integrator = steer_limited_by_safety or CS.steeringPressed or CS.vEgo < 5
 
