@@ -182,6 +182,13 @@ class CarController(CarControllerBase, MadsCarController):
       self.override_ramp = 0.0
       self.torque_lpf = 0.0
 
+    if below_min_steer_speed:
+      # The LKAS request is cleared below the cutoff, so the wire carries zero: report zero and drop the LPF
+      # tail so actuatorsOutput.torque matches what was sent. The override ramp is left alone on purpose --
+      # rolling off through 2 mph brings torque back through the LPF, not a fresh 1 s fade (night-star behaviour).
+      self.torque_lpf = 0.0
+      torque_cmd = 0.0
+
     # No STEER_DELTA rate limiter on this path, matching night-star's default (HondaSteerDeltaLimiter off):
     # the override cut must be immediate, and a limiter carrying last_torque across a one-frame disengage
     # would put stale torque on the wire at re-engage. Torque rise is bounded by the 1.0 s fade-up and the LPF.
