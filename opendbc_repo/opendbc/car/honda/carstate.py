@@ -11,6 +11,7 @@ from opendbc.car.honda.values import CAR, DBC, STEER_THRESHOLD, HONDA_BOSCH, HON
 from opendbc.car.interfaces import CarStateBase
 
 from opendbc.sunnypilot.car.honda.carstate_ext import CarStateExt
+from opendbc.sunnypilot.car.honda.values_ext import HondaFlagsSP
 
 TransmissionType = structs.CarParams.TransmissionType
 ButtonType = structs.CarState.ButtonEvent.Type
@@ -24,6 +25,15 @@ class CarState(CarStateBase, CarStateExt):
   def __init__(self, CP, CP_SP):
     CarStateBase.__init__(self, CP, CP_SP)
     CarStateExt.__init__(self, CP, CP_SP)
+
+    # Driver-override detection point on the steering torque sensor. Stock is 1200 counts. On the
+    # NRDR modified-EPS Civic Bosch the rack is strong enough that a mid-corner torque spike reads
+    # as an override at 1200 and lateral drops out, so the NRDR tune raises it. 1800 is Peter's
+    # road-tested value (night-star NrdrDriverOverrideThreshold = NrdrOverrideThresholdCenterBoost
+    # = 1800); with both equal the straight/curve centre-boost band collapses to one constant.
+    self.steer_threshold = STEER_THRESHOLD.get(CP.carFingerprint, 1200)
+    if CP.carFingerprint == CAR.HONDA_CIVIC_BOSCH and CP_SP.flags & HondaFlagsSP.EPS_MODIFIED:
+      self.steer_threshold = 1800
     can_define = CANDefine(DBC[CP.carFingerprint][Bus.pt])
 
     if CP.transmissionType != TransmissionType.manual:
@@ -139,7 +149,7 @@ class CarState(CarStateBase, CarStateExt):
     ret.gasPressed = cp.vl["POWERTRAIN_DATA"]["PEDAL_GAS"] > 1e-5
 
     ret.steeringTorque = cp.vl["STEER_STATUS"]["STEER_TORQUE_SENSOR"]
-    ret.steeringPressed = abs(ret.steeringTorque) > STEER_THRESHOLD.get(self.CP.carFingerprint, 1200)
+    ret.steeringPressed = abs(ret.steeringTorque) > self.steer_threshold
 
     if self.CP.carFingerprint in HONDA_BOSCH:
       # The PCM always manages its own cruise control state, but doesn't publish it
