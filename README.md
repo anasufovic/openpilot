@@ -1,5 +1,22 @@
 ![](https://user-images.githubusercontent.com/47793918/233812617-beab2e71-57b9-479e-8bff-c3931347ca40.png)
 
+## tici-honda-eps: modified-EPS Civic Bosch on comma 3
+
+This branch is sunnypilot `staging-tici` (v0.10.1, the last sunnypilot release that runs on a comma 3)
+plus three commits for a 2021 Civic Hatchback (`HONDA_CIVIC_BOSCH`) running the NRDR "Clarity-grade"
+EPS firmware `39990-TGG-A120-08072026-4250` (also matches the TBA-C020/C120 images). It replaces the
+old 2.5x-knee tune with the NRDR tune, hard-coded, no new toggles:
+
+- `interface.py`: identity torque map over 4096, NRDR four-point kp/ki schedule, kf 3.6e-6, steer at standstill.
+- `carstate.py`: driver-override threshold 1800 (Peter's value).
+- `carcontroller.py`: override fade (down 0 s / up 1.0 s), speed-banded torque low-pass (0.08/0.1/0.1 s),
+  driver assist during override, no torque below 2 mph.
+
+All of it is gated on the modded-EPS firmware marker (`39990-TGG,A120`); stock firmware and every other
+car behave exactly as `staging-tici`. Longitudinal is stock Honda ACC. The tune assumes the PID lateral
+controller, which is what Honda uses on this branch. Install string: `anasufovic/tici-honda-eps`.
+Do not run this with the stock EPS firmware or the old 2.5x image.
+
 ## 🌞 What is sunnypilot?
 [sunnypilot](https://github.com/sunnyhaibin/sunnypilot) is a fork of comma.ai's openpilot, an open source driver assistance system. sunnypilot offers the user a unique driving experience for over 300+ supported car makes and models with modified behaviors of driving assist engagements. sunnypilot complies with comma.ai's safety rules as accurately as possible.
 
