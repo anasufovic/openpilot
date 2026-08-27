@@ -265,8 +265,21 @@ class CarInterface(CarInterfaceBase):
 
     elif candidate in (CAR.HONDA_CIVIC_BOSCH, CAR.HONDA_CIVIC_BOSCH_DIESEL):
       if ret.flags & HondaFlagsSP.EPS_MODIFIED:
-        stock_cp.lateralParams.torqueBP, stock_cp.lateralParams.torqueV = [[0, 2564, 8000], [0, 2564, 3840]]
-        stock_cp.lateralTuning.pid.kpV, stock_cp.lateralTuning.pid.kiV = [[0.3], [0.09]]  # 2.5x Modded EPS
+        # NRDR modified-EPS tune for the "Clarity-grade" Civic Bosch firmware images (39990-TGG-A120-08072026-4250
+        # and the matching TBA-C020/C120 images). These rewrite the EPS torque table as a monotonic ramp, so the
+        # 2.5x knee map is gone: the request->torque map is the identity over the stock 4096 range and the PID
+        # gains are the NRDR four-point schedule (25 mph hand-off, 50 mph top band).
+        # Values: nrdr/openpilot nrdr-nightly efe4f758 opendbc/sunnypilot/car/honda/interface_ext.py
+        #         (configure_modified_eps); JamesL787/openpilot night-star-bosch-radar a58712ae, 9a219d89.
+        # kf is the scalar 3.6e-6 that night-star runs; this CarParams schema has no kfBP/kfV.
+        _low_max = 25. * CV.MPH_TO_MS
+        _bp = [0., _low_max - 1e-3, _low_max, 50. * CV.MPH_TO_MS]
+        stock_cp.lateralParams.torqueBP, stock_cp.lateralParams.torqueV = [[0, 4096], [0, 4096]]
+        stock_cp.lateralTuning.pid.kpBP, stock_cp.lateralTuning.pid.kpV = [_bp, [0.018, 0.024, 0.048, 0.060]]
+        stock_cp.lateralTuning.pid.kiBP, stock_cp.lateralTuning.pid.kiV = [_bp, [0.006, 0.008, 0.016, 0.020]]
+        stock_cp.lateralTuning.pid.kf = 3.6e-6
+        stock_cp.steerAtStandstill, stock_cp.autoResumeSng = True, True
+        stock_cp.minEnableSpeed, stock_cp.minSteerSpeed = -1.0, -1.0
 
     elif candidate == CAR.HONDA_CIVIC_2022:
       if ret.flags & HondaFlagsSP.EPS_MODIFIED:
