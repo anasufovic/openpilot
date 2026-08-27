@@ -263,15 +263,15 @@ class CarInterface(CarInterfaceBase):
         stock_cp.lateralParams.torqueBP, stock_cp.lateralParams.torqueV = [[0, 2560, 8000], [0, 2560, 3840]]
         stock_cp.lateralTuning.pid.kpV, stock_cp.lateralTuning.pid.kiV = [[0.3], [0.1]]
 
-    elif candidate in (CAR.HONDA_CIVIC_BOSCH, CAR.HONDA_CIVIC_BOSCH_DIESEL):
+    elif candidate == CAR.HONDA_CIVIC_BOSCH:
       if ret.flags & HondaFlagsSP.EPS_MODIFIED:
-        # NRDR modified-EPS tune for the "Clarity-grade" Civic Bosch firmware images (39990-TGG-A120-08072026-4250
-        # and the matching TBA-C020/C120 images). These rewrite the EPS torque table as a monotonic ramp, so the
-        # 2.5x knee map is gone: the request->torque map is the identity over the stock 4096 range and the PID
-        # gains are the NRDR four-point schedule (25 mph hand-off, 50 mph top band).
+        # NRDR modified-EPS tune for the Civic hatch 39990-TGG-A120-08072026-4250 firmware image only. It rewrites
+        # the EPS torque table as a monotonic ramp, so the 2.5x knee map is gone: the request->torque map is the
+        # identity over the stock 4096 range and the PID gains are the NRDR four-point schedule (25 mph hand-off,
+        # 50 mph top band). Not for the sedan TBA-C120 image (night-star caps that one at 3840).
         # Values: nrdr/openpilot nrdr-nightly efe4f758 opendbc/sunnypilot/car/honda/interface_ext.py
         #         (configure_modified_eps); JamesL787/openpilot night-star-bosch-radar a58712ae, 9a219d89.
-        # kf is the scalar 3.6e-6 that night-star runs; this CarParams schema has no kfBP/kfV.
+        # kf here is the scalar CarParams carries; the speed-banded kf is applied in latcontrol_pid.py.
         _low_max = 25. * CV.MPH_TO_MS
         _bp = [0., _low_max - 1e-3, _low_max, 50. * CV.MPH_TO_MS]
         stock_cp.lateralParams.torqueBP, stock_cp.lateralParams.torqueV = [[0, 4096], [0, 4096]]

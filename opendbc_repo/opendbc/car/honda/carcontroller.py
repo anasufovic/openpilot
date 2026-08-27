@@ -96,7 +96,7 @@ def process_hud_alert(hud_alert):
   return fcw_display, steer_required, acc_alert
 
 
-# NRDR modified-EPS steering command shaping (Civic Bosch on the TGG-A120 4250 / C020 / C120 images).
+# NRDR modified-EPS steering command shaping (Civic Bosch on the 39990-TGG-A120-08072026-4250 image).
 # Values are the ones Peter runs on night-star (2026-08-27 toggle backup), hard-coded here on purpose:
 #   HondaOverrideFadeDownSecs 0.0, HondaOverrideFadeUpSecs 1.0, HondaOverrideTorqueScale 0,
 #   HondaDriverAssistDuringOverride on, HondaTorqueLowPassFilter on,
@@ -182,17 +182,15 @@ class CarController(CarControllerBase, MadsCarController):
       self.override_ramp = 0.0
       self.torque_lpf = 0.0
 
-    # Keep the upstream STEER_DELTA rate limiter as the last stage. Deliberate deviation: night-star
-    # only applies it when HondaSteerDeltaLimiter is on (off by default). It bounds the override cut
-    # to ~0.17 s from full torque, comparable to the LPF tail, and keeps upstream's request shaping.
-    limited_torque = rate_limit(torque_cmd, self.last_torque, -self.params.STEER_DELTA_DOWN * DT_CTRL,
-                                self.params.STEER_DELTA_UP * DT_CTRL)
+    # No STEER_DELTA rate limiter on this path, matching night-star's default (HondaSteerDeltaLimiter off):
+    # the override cut must be immediate, and a limiter carrying last_torque across a one-frame disengage
+    # would put stale torque on the wire at re-engage. Torque rise is bounded by the 1.0 s fade-up and the LPF.
     self.lat_active_prev = CC.latActive
 
     # Driver assist during override: keep STEER_TORQUE_REQUEST asserted while the driver overrides
     # (the command itself is already faded to zero), so the EPS does not drop out and re-engage.
     lkas_active = CC.latActive and not below_min_steer_speed
-    return limited_torque, lkas_active
+    return torque_cmd, lkas_active
 
   def update(self, CC, CC_SP, CS, now_nanos):
     MadsCarController.update(self, self.CP, CC, CC_SP)

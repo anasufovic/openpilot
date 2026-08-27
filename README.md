@@ -4,10 +4,11 @@
 
 This branch is sunnypilot `staging-tici` (v0.10.1, the last sunnypilot release that runs on a comma 3)
 plus three commits for a 2021 Civic Hatchback (`HONDA_CIVIC_BOSCH`) running the NRDR "Clarity-grade"
-EPS firmware `39990-TGG-A120-08072026-4250` (also matches the TBA-C020/C120 images). It replaces the
+EPS firmware `39990-TGG-A120-08072026-4250` (this hatch image only, not the sedan C120). It replaces the
 old 2.5x-knee tune with the NRDR tune, hard-coded, no new toggles:
 
-- `interface.py`: identity torque map over 4096, NRDR four-point kp/ki schedule, kf 3.6e-6, steer at standstill.
+- `interface.py` + `latcontrol_pid.py`: identity torque map over 4096, NRDR four-point kp/ki schedule,
+  speed-banded kf (2.4/1.8/3.6/6.0e-6), steer at standstill.
 - `carstate.py`: driver-override threshold 1800 (Peter's value).
 - `carcontroller.py`: override fade (down 0 s / up 1.0 s), speed-banded torque low-pass (0.08/0.1/0.1 s),
   driver assist during override, no torque below 2 mph.
