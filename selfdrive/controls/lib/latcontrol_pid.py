@@ -23,7 +23,15 @@ class LatControlPID(LatControl):
                              (CP.lateralTuning.pid.kiBP, CP.lateralTuning.pid.kiV),
                              k_f=CP.lateralTuning.pid.kf, pos_limit=self.steer_max, neg_limit=-self.steer_max)
     self.get_steer_feedforward = CI.get_steer_feedforward_function()
-    self.eps_mod_banded_kf = CP.carFingerprint == HONDA.HONDA_CIVIC_BOSCH and bool(CP_SP.flags & HondaFlagsSP.EPS_MODIFIED)
+    self.eps_mod = CP.carFingerprint == HONDA.HONDA_CIVIC_BOSCH and bool(CP_SP.flags & HondaFlagsSP.EPS_MODIFIED)
+
+  def reset(self):
+    super().reset()
+    if self.eps_mod:
+      # controlsd calls this every frame lateral is inactive. Drop the PID state so a stale integrator is not
+      # re-injected at the next engagement (the modified-EPS fade-up would otherwise mask it for 1 s and then
+      # apply it in full).
+      self.pid.reset()
 
   def update(self, active, CS, VM, params, steer_limited_by_safety, desired_curvature, calibrated_pose, curvature_limited):
     pid_log = log.ControlsState.LateralPIDState.new_message()
@@ -42,10 +50,15 @@ class LatControlPID(LatControl):
 
     else:
       # offset does not contribute to resistive torque
-      if self.eps_mod_banded_kf:
+      if self.eps_mod:
         self.pid.k_f = float(np.interp(CS.vEgo, EPS_MOD_KF_BP, EPS_MOD_KF_V))
       ff = self.get_steer_feedforward(angle_steers_des_no_offset, CS.vEgo)
-      freeze_integrator = steer_limited_by_safety or CS.steeringPressed or CS.vEgo < 5
+      # On the modified-EPS Civic Bosch the carcontroller deliberately shapes the command (override fade, LPF),
+      # so actuatorsOutput.torque differs from actuators.torque on most frames and steer_limited_by_safety is
+      # set although nothing limited us (45% of active frames on the 2026-08-27 drive). Don't let that starve
+      # the integrator; steeringPressed and the 5 m/s floor still freeze it. Bounded I growth is possible during
+      # the 1 s fade-up windows above 5 m/s (<= ~0.2 at ki 0.02 and 10 deg error).
+      freeze_integrator = (steer_limited_by_safety and not self.eps_mod) or CS.steeringPressed or CS.vEgo < 5
 
       output_torque = self.pid.update(error,
                                 feedforward=ff,
