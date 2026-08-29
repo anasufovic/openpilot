@@ -15,7 +15,7 @@ from opendbc.car.car_helpers import interfaces
 from opendbc.car.vehicle_model import VehicleModel
 from openpilot.selfdrive.controls.lib.drive_helpers import clip_curvature
 from openpilot.selfdrive.controls.lib.latcontrol import LatControl
-from openpilot.selfdrive.controls.lib.latcontrol_pid import LatControlPID
+from openpilot.selfdrive.controls.lib.latcontrol_pid import LatControlPID, eps_mod_steer_ratio
 from openpilot.selfdrive.controls.lib.latcontrol_angle import LatControlAngle, STEER_ANGLE_SATURATION_THRESHOLD
 from openpilot.selfdrive.controls.lib.latcontrol_torque import LatControlTorque
 from openpilot.selfdrive.controls.lib.longcontrol import LongControl
@@ -84,6 +84,10 @@ class Controls(ControlsExt, ModelStateBase):
     x = max(lp.stiffnessFactor, 0.1)
     sr = max(lp.steerRatio, 0.1)
     self.VM.update_params(x, sr)
+    if getattr(self.LaC, "eps_mod", False):
+      # variable-ratio rack: read the measured curvature through the same angle-dependent ratio the lateral
+      # controller commands with (see latcontrol_pid.EPS_MOD_SR_*), so feedback and command agree
+      self.VM.sR = eps_mod_steer_ratio(CS.steeringAngleDeg, CS.vEgo, sr)
 
     steer_angle_without_offset = math.radians(CS.steeringAngleDeg - lp.angleOffsetDeg)
     self.curvature = -self.VM.calc_curvature(steer_angle_without_offset, CS.vEgo, lp.roll)

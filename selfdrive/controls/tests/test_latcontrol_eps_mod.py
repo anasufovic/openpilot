@@ -11,7 +11,8 @@ from opendbc.car import structs
 from opendbc.car.honda.interface import CarInterface
 from opendbc.car.honda.values import CAR
 from openpilot.selfdrive.controls.lib.latcontrol_pid import (LatControlPID, phase_with_latch, EPS_MOD_KF_BP, EPS_MOD_KF_V,
-                                                             EPS_MOD_UNWIND_PERSIST_S, EPS_MOD_DRIVER_HOLD_COUNTS)
+                                                             EPS_MOD_UNWIND_PERSIST_S, EPS_MOD_DRIVER_HOLD_COUNTS,
+                                                             EPS_MOD_SR_BP, EPS_MOD_SR_V, eps_mod_steer_ratio, eps_mod_desired_angle)
 
 FP = {0: {}, 1: {}, 2: {}}
 MODDED_FW = b'39990-TGG,A120\x00\x00'
@@ -19,9 +20,14 @@ STOCK_FW = b'39990-TGG-A120\x00\x00'
 
 
 class _VM:
-  # linear plant for the tests: 1 deg of steer per 1e-3 1/m of curvature, speed independent
+  # VehicleModel stand-in, linear in sR like the real formula. Scaled so that at the curve's centre ratio (15.1)
+  # a curvature of 1e-3 1/m maps to 1 deg: the eps-mod solver then returns ~the intended angle (exactly near
+  # centre, a few % less at large angles, as the real rack does).
+  def __init__(self):
+    self.sR = 15.1
+
   def get_steer_from_curvature(self, curv, v_ego, roll):
-    return math.radians(curv * 1000.0)
+    return math.radians(curv * 1000.0) * self.sR / 15.1
 
 
 class _CS:
@@ -42,6 +48,7 @@ def _controller(fw):
 
 def _step(lc, active, cs, desired_deg, limited=False):
   params = log.LiveParametersData.new_message()
+  params.steerRatio = 15.1
   out, _, _ = lc.update(active, cs, _VM(), params, limited, -desired_deg / 1000.0, None, False)
   return out
 
@@ -130,9 +137,9 @@ def test_no_decay_before_persistence():
   for k in range(n):
     des = 60.0 - 0.5 * k
     _step(lc, True, _CS(8.0, 60.0), des)  # unwinding with error opposing I, but not yet for 0.2 s
-  # only normal integration of the (small, opposite-sign) error may have happened, not the 0.25 s decay
-  # (decay over these frames would have removed ~50% of i0)
-  assert i0 - lc.pid.i < 0.02 * i0
+  # only normal integration of the (small, opposite-sign) error may have happened, not the 0.25 s decay:
+  # ki 0.008 * ~5 deg * 0.18 s ~= 0.007 (~3% of i0); decay over these frames would have removed ~50% of i0
+  assert i0 - lc.pid.i < 0.05 * i0
 
 
 def test_dither_does_not_strip_integral():
@@ -147,7 +154,7 @@ def test_dither_does_not_strip_integral():
   for k in range(400):
     des = 60.0 - 0.5 * (k % 5)
     _step(lc, True, _CS(8.0, 61.0), des)
-    expected += (des - 61.0) * lc.pid.k_i * 0.01
+    expected += (lc.pid.p / lc.pid.k_p) * lc.pid.k_i * 0.01   # the controller's own error this frame
   assert lc.pid.i == pytest.approx(expected, rel=0.02)
   # sanity: the same amplitude with 25 consecutive unwind frames (> 0.2 s) DOES decay well beyond integration
   lc2 = _controller(MODDED_FW)
@@ -156,7 +163,7 @@ def test_dither_does_not_strip_integral():
   for k in range(400):
     des = 60.0 - 0.5 * (k % 26)
     _step(lc2, True, _CS(8.0, 61.0), des)
-    expected2 += (des - 61.0) * lc2.pid.k_i * 0.01
+    expected2 += (lc2.pid.p / lc2.pid.k_p) * lc2.pid.k_i * 0.01
   assert lc2.pid.i < 0.5 * expected2
 
 
@@ -230,3 +237,69 @@ def test_stock_integrates_through_driver_hold():
   for _ in range(100):
     _step(lc, True, _CS(15.0, 0.0, torque=1200.0), 0.5)
   assert lc.pid.i > 0.0
+
+
+def test_steer_ratio_curve_shape():
+  assert list(EPS_MOD_SR_BP) == sorted(EPS_MOD_SR_BP)
+  assert all(a >= b for a, b in zip(EPS_MOD_SR_V, EPS_MOD_SR_V[1:]))  # monotone non-increasing with angle
+  # low speed: absolute measured curve, symmetric in angle, clamped beyond the table
+  assert eps_mod_steer_ratio(0.0, 5.0, 16.3) == EPS_MOD_SR_V[0]
+  assert eps_mod_steer_ratio(-300.0, 5.0, 16.3) == eps_mod_steer_ratio(300.0, 5.0, 16.3) == 13.0
+  assert eps_mod_steer_ratio(1000.0, 5.0, 16.3) == EPS_MOD_SR_V[-1]
+  # highway: learned centre ratio with the measured taper -> unchanged from before on straights
+  assert eps_mod_steer_ratio(0.0, 25.0, 16.3) == pytest.approx(16.3)
+  assert eps_mod_steer_ratio(300.0, 25.0, 16.3) == pytest.approx(16.3 * 13.0 / 15.1)
+  # blend is monotone in speed
+  assert eps_mod_steer_ratio(0.0, 5.0, 16.3) < eps_mod_steer_ratio(0.0, 13.5, 16.3) < eps_mod_steer_ratio(0.0, 25.0, 16.3)
+
+
+class _LinVM:
+  """VehicleModel stand-in: angle = curvature * wheelbase * sR (linear in sR, like the real formula)."""
+  def __init__(self, sr=16.3): self.sR = sr
+  def get_steer_from_curvature(self, curv, v_ego, roll): return curv * 2.7 * self.sR
+
+
+def test_desired_angle_solved_at_desired_angle_not_measured():
+  vm = _LinVM()
+  # a curvature whose correct low-speed solution is 300 deg: 300 = base * SR(300) with SR(300) = 13.0
+  base_deg = 300.0 / 13.0
+  curv = math.radians(base_deg) / 2.7
+  theta = eps_mod_desired_angle(vm, curv, 5.0, 0.0, 16.3)
+  assert theta == pytest.approx(300.0, abs=0.5)
+  assert vm.sR == pytest.approx(13.0, abs=0.01)
+  # the measured-angle shortcut would have asked 300 * 15.1 / 13.0 = 348 deg from centre; we must not
+  assert theta < 305.0
+  # sign symmetric
+  assert eps_mod_desired_angle(vm, -curv, 5.0, 0.0, 16.3) == pytest.approx(-300.0, abs=0.5)
+  # near centre at highway speed the learned ratio is used unchanged
+  vm2 = _LinVM()
+  small = math.radians(5.0 / 16.3) / 2.7
+  assert eps_mod_desired_angle(vm2, small, 25.0, 0.0, 16.3) == pytest.approx(5.0, abs=0.01)
+
+
+def test_modded_uses_curve_stock_does_not():
+  params = log.LiveParametersData.new_message()
+  for fw, expect_curve in ((MODDED_FW, True), (STOCK_FW, False)):
+    lc = _controller(fw); vm = _LinVM()
+    lc.update(True, _CS(4.0, 300.0), vm, params, False, -math.radians(300.0 / 13.0) / 2.7, None, False)
+    if expect_curve:
+      assert vm.sR == pytest.approx(13.0, abs=0.01)
+    else:
+      assert vm.sR == 16.3
+
+
+def test_controlsd_feedback_mutation_does_not_double_taper():
+  """controlsd sets VM.sR to the measured-angle ratio for its feedback path before calling update(); the
+  command path must take the learned centre from liveParameters, not from the already-tapered VM.sR."""
+  lc = _controller(MODDED_FW)
+  params = log.LiveParametersData.new_message()
+  params.steerRatio = 16.3
+  vm = _LinVM(sr=16.3)
+  # highway speed, sustained 300 deg curve: correct answer is learned centre with one taper = 16.3 * 13.0 / 15.1
+  vm.sR = eps_mod_steer_ratio(300.0, 25.0, 16.3)          # what controlsd does first
+  expected_sr = 16.3 * 13.0 / 15.1
+  base = 300.0 / expected_sr
+  curv = math.radians(base) / 2.7
+  _, angle_des, _ = lc.update(True, _CS(25.0, 300.0), vm, params, False, -curv, None, False)
+  assert angle_des == pytest.approx(300.0, abs=1.0)
+  assert vm.sR == pytest.approx(expected_sr, abs=0.05)

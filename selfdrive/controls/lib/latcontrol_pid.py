@@ -38,6 +38,44 @@ def phase_with_latch(angle: float, angle_delta: float, v_ego: float, direction: 
   return abs(phase) * direction, direction
 
 
+# Steer ratio vs |wheel angle| for this rack (39990-TGG-A120, Civic hatch). The rack is variable-ratio: CarParams
+# carries a single 15.38 ("10.93 is end-to-end spec", opendbc honda/values.py) and paramsd learns ~16.3 near
+# centre, so the angle computed for a tight-corner curvature was 15-25% too large above ~150 deg and the car
+# over-rotated on every 90 (drive-log 2026-08-28 night). Measured end to end (wheel angle -> yaw rate, livePose,
+# 0.3 s lag, 2-9 m/s, 44k samples over five drives): 15.0 at 5-30 deg, 14.2 at 30-110, 13.4 at 110-220, 13.0 at
+# 220-300, 12.5 at 300-400; stable across drives and lag choices. Same shape and within 3% of night-star's
+# Peter-measured C020 curve (NRDR_CIVIC_BOSCH_SR_CURVE 14.96 -> 12.77).
+# Use: below 9 m/s (where it was measured) the absolute curve; by 18 m/s blended fully onto paramsd's learned
+# centre ratio carrying the measured taper (nrdr's "warp the learned scalar" approach), so highway behaviour is
+# unchanged from before. The desired angle is solved AT THE DESIRED ANGLE (fixed point of theta = base * SR(theta);
+# night-star's VGR path and Codex review 2026-08-29 both call for this -- selecting SR at the measured angle
+# overstates the target during turn-in and understates it during unwind). The feedback path (controlsd
+# calc_curvature) reads the measured angle through SR at the measured angle, which is the correct direction there.
+EPS_MOD_SR_BP = [0.0, 30.0, 60.0, 110.0, 155.0, 220.0, 300.0, 400.0, 480.0]
+EPS_MOD_SR_V = [15.1, 15.1, 14.6, 14.2, 13.7, 13.3, 13.0, 12.5, 12.2]
+EPS_MOD_SR_BLEND_V = [9.0, 18.0]   # m/s: measured-absolute below, learned-centre-with-taper above
+
+
+def eps_mod_steer_ratio(angle_deg: float, v_ego: float, learned_sr: float) -> float:
+  measured = float(np.interp(abs(angle_deg), EPS_MOD_SR_BP, EPS_MOD_SR_V))
+  learned_tapered = learned_sr * measured / EPS_MOD_SR_V[0]
+  w = float(np.interp(v_ego, EPS_MOD_SR_BLEND_V, [0.0, 1.0]))
+  return (1.0 - w) * measured + w * learned_tapered
+
+
+def eps_mod_desired_angle(VM, desired_curvature: float, v_ego: float, roll: float, learned_sr: float) -> float:
+  """Desired wheel angle (deg, no offset) for a variable-ratio rack: solve theta = base * SR(theta), where base is
+  VM.get_steer_from_curvature at unit ratio (the VM formula is linear in sR). Converges in a few iterations since
+  |dSR/dtheta| is small. Leaves VM.sR at the ratio for the solved angle."""
+  VM.sR = 1.0
+  base = math.degrees(VM.get_steer_from_curvature(desired_curvature, v_ego, roll))
+  theta = base * eps_mod_steer_ratio(0.0, v_ego, learned_sr)
+  for _ in range(5):
+    theta = base * eps_mod_steer_ratio(theta, v_ego, learned_sr)
+  VM.sR = eps_mod_steer_ratio(theta, v_ego, learned_sr)
+  return theta
+
+
 class LatControlPID(LatControl):
   def __init__(self, CP, CP_SP, CI):
     super().__init__(CP, CP_SP, CI)
@@ -66,7 +104,12 @@ class LatControlPID(LatControl):
     pid_log.steeringAngleDeg = float(CS.steeringAngleDeg)
     pid_log.steeringRateDeg = float(CS.steeringRateDeg)
 
-    angle_steers_des_no_offset = math.degrees(VM.get_steer_from_curvature(-desired_curvature, CS.vEgo, params.roll))
+    if self.eps_mod:
+      # learned centre ratio straight from liveParameters: controlsd has already overwritten VM.sR with the
+      # measured-angle ratio for its feedback path, so VM.sR must not be reused as the centre (double taper)
+      angle_steers_des_no_offset = eps_mod_desired_angle(VM, -desired_curvature, CS.vEgo, params.roll, max(params.steerRatio, 0.1))
+    else:
+      angle_steers_des_no_offset = math.degrees(VM.get_steer_from_curvature(-desired_curvature, CS.vEgo, params.roll))
     angle_steers_des = angle_steers_des_no_offset + params.angleOffsetDeg
     error = angle_steers_des - CS.steeringAngleDeg
 
