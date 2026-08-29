@@ -11,7 +11,7 @@ from opendbc.car import structs
 from opendbc.car.honda.interface import CarInterface
 from opendbc.car.honda.values import CAR
 from openpilot.selfdrive.controls.lib.latcontrol_pid import (LatControlPID, phase_with_latch, EPS_MOD_KF_BP, EPS_MOD_KF_V,
-                                                             EPS_MOD_UNWIND_PERSIST_S)
+                                                             EPS_MOD_UNWIND_PERSIST_S, EPS_MOD_DRIVER_HOLD_COUNTS)
 
 FP = {0: {}, 1: {}, 2: {}}
 MODDED_FW = b'39990-TGG,A120\x00\x00'
@@ -25,11 +25,12 @@ class _VM:
 
 
 class _CS:
-  def __init__(self, v_ego=8.0, angle=0.0, pressed=False):
+  def __init__(self, v_ego=8.0, angle=0.0, pressed=False, torque=None):
     self.vEgo = v_ego
     self.steeringAngleDeg = angle
     self.steeringRateDeg = 0.0
     self.steeringPressed = pressed
+    self.steeringTorque = torque if torque is not None else (2500.0 if pressed else 0.0)
 
 
 def _controller(fw):
@@ -177,16 +178,18 @@ def test_decay_rate_matches_time_constant():
 def test_override_release_mid_unwind_does_not_decay_immediately():
   lc = _controller(MODDED_FW)
   _wind(lc)
-  i0 = lc.pid.i
-  # unwinding slowly while the driver holds the wheel (PID frozen) for 1 s: desired 60 -> 57
+  assert lc.pid.i > 0.2
+  # unwinding slowly while the driver holds the wheel (override): I is cleared and persistence must not arm
   for k in range(100):
     _step(lc, True, _CS(8.0, 60.0, pressed=True), 60.0 - 0.03 * k)
-  assert lc.pid.i == pytest.approx(i0)
-  # driver lets go: persistence must restart, so the next 15 frames (< 0.2 s) cannot decay. Normal integration
-  # of the ~-3.5 deg error over 15 frames is ~0.004; a pre-armed decay would remove ~45% of i0.
+    assert lc.pid.i == 0.0
+  assert lc.unwind_frames == 0
+  # driver lets go with the car ahead of the model (error opposes any I): I restarts from zero and only plain
+  # integration of the small negative error may happen in the first 15 frames -- no decay path is armed
   for k in range(100, 115):
     _step(lc, True, _CS(8.0, 60.0), 60.0 - 0.03 * k)
-  assert i0 - lc.pid.i < 0.03 * i0
+  assert abs(lc.pid.i) < 0.01
+  assert lc.unwind_frames <= 15
 
 
 def test_phase_with_latch():
@@ -194,3 +197,36 @@ def test_phase_with_latch():
   assert phase_with_latch(10.0, -1.0, 5.0, 1.0) == (-10.0, -1.0)
   assert phase_with_latch(-10.0, -1.0, 5.0, 0.0) == (10.0, 1.0)
   assert phase_with_latch(10.0, -1.0, 0.1, 1.0) == (10.0, 1.0)  # latched below 0.5 mph
+
+
+def test_no_integration_while_driver_holds_below_threshold():
+  lc = _controller(MODDED_FW)
+  # steady 10 deg error with the driver holding 1200 counts (below the 1800 override threshold): I must not wind
+  for _ in range(300):
+    _step(lc, True, _CS(15.0, 0.0, torque=1200.0), 10.0)
+  assert lc.pid.i == 0.0
+  # same error with a resting hand below the hold threshold: integrates normally
+  lc2 = _controller(MODDED_FW)
+  for _ in range(300):
+    _step(lc2, True, _CS(15.0, 0.0, torque=EPS_MOD_DRIVER_HOLD_COUNTS - 100.0), 10.0)
+  assert lc2.pid.i > 0.05
+
+
+def test_override_clears_integrator_and_release_restarts_from_zero():
+  lc = _controller(MODDED_FW)
+  _wind(lc)
+  assert lc.pid.i > 0.2
+  _step(lc, True, _CS(8.0, 45.0, pressed=True), 60.0)
+  assert lc.pid.i == 0.0
+  for _ in range(20):
+    _step(lc, True, _CS(8.0, 45.0, pressed=True), 60.0)
+  assert lc.pid.i == 0.0
+  _step(lc, True, _CS(8.0, 45.0), 60.0)  # released
+  assert 0.0 < lc.pid.i < 0.01
+
+
+def test_stock_integrates_through_driver_hold():
+  lc = _controller(STOCK_FW)
+  for _ in range(100):
+    _step(lc, True, _CS(15.0, 0.0, torque=1200.0), 0.5)
+  assert lc.pid.i > 0.0

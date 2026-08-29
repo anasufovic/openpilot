@@ -24,6 +24,11 @@ EPS_MOD_PHASE_SWITCH_MIN_SPEED = 0.5 * _MPH
 # unwind phase has persisted this long, so model dither at an intersection cannot strip a needed integral.
 EPS_MOD_UNWIND_I_DECAY_TAU_S = 0.25
 EPS_MOD_UNWIND_PERSIST_S = 0.2
+# Driver-hand handling (ours; no reference does this). Below the 1800-count override threshold the stock logic
+# keeps integrating against a driver who is holding the wheel: on the 2026-08-28 drive the integrator wound to
+# +-0.65 (~2700 counts) against the driver's hand for 45 s on an off-ramp, and 16% of active time was spent with
+# 800-1800 counts on the wheel. Hands-off sensor noise is < 300 counts; a resting hand reads ~130-700.
+EPS_MOD_DRIVER_HOLD_COUNTS = 800.0
 
 
 def phase_with_latch(angle: float, angle_delta: float, v_ego: float, direction: float) -> tuple[float, float]:
@@ -88,6 +93,15 @@ class LatControlPID(LatControl):
       freeze_integrator = (steer_limited_by_safety and not self.eps_mod) or CS.steeringPressed or CS.vEgo < 5
 
       if self.eps_mod:
+        # (a) a driver holding the wheel below the override threshold is not an error to integrate away:
+        #     don't wind the integrator against their hand.
+        # (b) a driver override means the plan was wrong: clear the integrator instead of freezing it, so
+        #     nothing stale is re-injected on release (the carcontroller fades torque back in from zero anyway).
+        if CS.steeringPressed:
+          self.pid.i = 0.0
+        elif abs(CS.steeringTorque) > EPS_MOD_DRIVER_HOLD_COUNTS:
+          freeze_integrator = True
+
         # Unwind handling for the modified-EPS Civic Bosch. Drive 2 (2026-08-27, route 005d227007) showed the
         # integrator winding to -0.38 in a long turn and then cancelling P for 2-3 s after the model reversed
         # ("green line moves, car does nothing"). Two rules, both only while the PID is not otherwise frozen
